@@ -320,7 +320,6 @@ class EngineDrivenContext(ABC):
                 self.mq_timeout, group_idx, skip_count,
             )
             return False
-
     def prepare_retrieve_raw(
         self, key: IPCCacheServerKey, instance_id: int
     ) -> bytes | None:
@@ -1004,7 +1003,6 @@ def _serialize_multi_group_chunks(
 
 
 
-
 def _deserialize_multi_group_chunks(
     cpu_data: bytes,
 ) -> list[list[torch.Tensor]]:
@@ -1090,6 +1088,67 @@ def slice_kv_caches_for_group(
     """
     all_values = list(kv_caches.values())
     return {str(i): all_values[idx] for i, idx in enumerate(sorted(layer_indices))}
+
+def gather_paged_kv_multi_group_to_cpu_streams(
+    kv_caches: dict[str, torch.Tensor],
+    block_ids: list[list[int]],
+    engine_group_infos: list[EngineGroupInfo],
+    lmcache_tokens_per_chunk: int,
+    layout_hints: LayoutHints | None = None,
+    pinned_pool: "PinnedBufferPool | None" = None,
+) -> list[list[torch.Tensor]]:
+    """Multi-stream variant of :func:`gather_paged_kv_multi_group_to_cpu`.
+
+    Runs each group's gather on its own CUDA stream so the GPU->CPU
+    copies can in principle overlap.  Disabled by default because the
+    PCIe bus is shared on most consumer GPUs and the per-stream
+    synchronisation overhead dominates the small overlap win.  See
+    ``LMCACHE_MP_MULTI_STREAM_D2D`` env var.
+    """
+    import threading
+    streams = [torch.cuda.Stream() for _ in engine_group_infos]
+    # Launch each group's gather on its own stream
+    results: list[list[torch.Tensor] | None] = [None] * len(engine_group_infos)
+
+    def _do(g_idx: int) -> None:
+        with torch.cuda.stream(streams[g_idx]):
+            results[g_idx] = gather_paged_kv_to_cpu(
+                slice_kv_caches_for_group(kv_caches, engine_group_infos[g_idx].layer_indices),
+                block_ids[g_idx],
+                # blocks_in_chunk computed inside, pass engine_group_infos
+                _blocks_in_chunk_for(
+                    kv_caches, engine_group_infos[g_idx], lmcache_tokens_per_chunk, layout_hints,
+                ),
+                layout_hints=layout_hints,
+                pinned_pool=pinned_pool,
+            )
+
+    threads = [threading.Thread(target=_do, args=(i,)) for i in range(len(engine_group_infos))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    # Final sync: each stream + main
+    for s in streams:
+        s.synchronize()
+    return [r for r in results if r is not None]
+
+
+def _blocks_in_chunk_for(
+    kv_caches: dict[str, torch.Tensor],
+    info: EngineGroupInfo,
+    lmcache_tokens_per_chunk: int,
+    layout_hints: LayoutHints | None,
+) -> int:
+    g_kv = slice_kv_caches_for_group(kv_caches, info.layer_indices)
+    tpb = info.tokens_per_block if info.tokens_per_block > 0 else 1
+    if info.tokens_per_block <= 0:
+        # tokens_per_block unknown; fall back to vLLM block_size from layout
+        _, _, _, _, _ = compute_kv_layout(g_kv, layout_hints=layout_hints)
+        tpb = 1
+    return lmcache_tokens_per_chunk // tpb
+
+
 
 def gather_paged_kv_multi_group_to_cpu_streams(
     kv_caches: dict[str, torch.Tensor],
